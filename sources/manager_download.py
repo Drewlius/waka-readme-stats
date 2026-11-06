@@ -260,9 +260,23 @@ class DownloadManager:
         :return: Response JSON dictionary.
         """
         headers = {"Authorization": f"Bearer {EM.GH_TOKEN}"}
-        res = await DownloadManager._client.post(
-            "https://api.github.com/graphql", json={"query": Template(GITHUB_API_QUERIES[query]).substitute(kwargs)}, headers=headers
-        )
+        try:
+            # The httpx read timeout can fail to fire when the TLS stream stalls
+            # before response headers arrive (6h hang observed in Actions).
+            # asyncio.timeout is enforced by the event loop, so it always breaks.
+            async with asyncio.timeout(45):
+                res = await DownloadManager._client.post(
+                    "https://api.github.com/graphql", json={"query": Template(GITHUB_API_QUERIES[query]).substitute(kwargs)}, headers=headers
+                )
+        except TimeoutError:
+            DBM.w("GraphQL query timed out waiting for response headers; dropping connection and retrying...")
+            # Do not aclose() the old client: a connection stuck mid-read can
+            # hang shutdown too. Dropping the reference is safe in this container.
+            DownloadManager._client = AsyncClient(timeout=60.0)
+            if retries_count > 0:
+                await asyncio.sleep(1.0)
+                return await DownloadManager._fetch_graphql_query(query, retries_count - 1, **kwargs)
+            raise
         if res.status_code == 200:
             return res.json()
 
